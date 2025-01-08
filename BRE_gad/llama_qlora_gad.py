@@ -1,0 +1,201 @@
+import torch
+from transformers import AutoModelForCausalLM, AutoTokenizer
+from peft import PromptEncoderConfig, TaskType, get_peft_model, PromptEncoderReparameterizationType, LoraConfig
+import matplotlib.pyplot as plt
+import numpy as np
+from tqdm import tqdm
+import time
+
+# 读取训练数据
+with open('./combined_train.tsv', 'r') as file:
+    train_data = file.readlines()
+
+train_texts = []
+train_labels = []
+
+invalid_lines_count = 0
+
+for line in train_data:
+    if line.strip():
+        parts = line.strip().split("\t")
+        # 检查是否有两个部分
+        if len(parts) == 2:
+            word, label = parts
+            if len(word) == 1 and not word.isalnum():
+                train_texts.append(word)
+                train_labels.append("O")
+            else:
+                train_texts.append(word)
+                train_labels.append(label)
+        else:
+            # 记录不符合格式的行
+            invalid_lines_count += 1
+
+# 输出不符合格式的行数
+print(f"Number of invalid lines: {invalid_lines_count}")
+# 初始化设备和模型
+device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
+tokenizer = AutoTokenizer.from_pretrained("/data/aim_nuist/aim_zhujj/llama3")
+base_model = AutoModelForCausalLM.from_pretrained("/data/aim_nuist/aim_zhujj/llama3")
+
+tokenizer.pad_token = tokenizer.eos_token
+lora_config = LoraConfig(
+    task_type=TaskType.CAUSAL_LM,
+    target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+    inference_mode=False,  # 训练模式
+    r=8,  # Lora 秩
+    lora_alpha=32,  # Lora alaph，具体作用参见 Lora 原理
+    lora_dropout=0.1  # Dropout 比例
+)
+model = get_peft_model(base_model, lora_config)
+
+# 构建微调文本
+train_texts = ['''please select labels from the following range according to the text : true,false  ''' + text for text in train_texts]
+
+# 对标签进行编码
+train_encodings = tokenizer(train_texts, truncation=True, padding=True, return_tensors="pt", max_length=128)
+train_labels_encodings = tokenizer(train_labels, truncation=True, padding=True, return_tensors="pt", max_length=128)
+
+# 定义数据集类
+class Dataset(torch.utils.data.Dataset):
+    def __init__(self, encodings, labels_encodings):
+        self.encodings = encodings
+        self.labels_encodings = labels_encodings
+
+    def __getitem__(self, idx):
+        item = {key: torch.tensor(val[idx]) for key, val in self.encodings.items()}
+        item['labels'] = torch.tensor(self.labels_encodings['input_ids'][idx])
+        return item
+
+    def __len__(self):
+        return len(self.encodings.input_ids)
+
+train_dataset = Dataset(train_encodings, train_labels_encodings)
+train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=16, shuffle=True)
+
+# 定义微调参数和优化器
+optimizer = torch.optim.AdamW(model.parameters(), lr=1e-5)
+model.to(device)
+
+# 开始微调
+epochs = 2
+train_losses = []
+
+for epoch in range(epochs):
+    model.train()
+    epoch_loss = 0
+    start_time = time.time()  # 记录开始时间
+
+    # 使用 tqdm 创建训练循环的进度条
+    with tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs}", unit="batch") as tepoch:
+        for batch in tepoch:
+            optimizer.zero_grad()
+            input_ids = batch["input_ids"].to(device)
+            attention_mask = batch["attention_mask"].to(device)
+            labels = batch["labels"].to(device)
+            max_seq_length = input_ids.shape[1]
+
+            # Pad the labels to match the input sequence length
+            padded_labels = torch.nn.functional.pad(labels, (0, max_seq_length - labels.shape[1]), value=-100).to(device)
+            outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=padded_labels)
+            loss = outputs.loss
+            loss.backward()
+            optimizer.step()
+            epoch_loss += loss.item()
+
+            # Update the progress bar description with the current loss
+            tepoch.set_postfix(loss=loss.item())
+
+    train_losses.append(epoch_loss / len(train_loader))
+    print(f"Epoch {epoch + 1}/{epochs} - Average Loss: {epoch_loss / len(train_loader):.4f}\n")
+
+# 绘制损失曲线
+plt.plot(np.arange(1, epochs + 1), train_losses, label="Training Loss")
+plt.xlabel("Epochs")
+plt.ylabel("Loss")
+plt.title("Training Loss Curve")
+plt.legend()
+plt.savefig("training_loss_curve.png")
+
+# 保存模型参数
+torch.save(model.state_dict(), "/data/aim_nuist/aim_zhujj/xinjian/llama_gad_qlora_model.pt")
+import transformers
+# 导入模型参数
+base_model = AutoModelForCausalLM.from_pretrained("/data/aim_nuist/aim_zhujj/llama3")
+model = get_peft_model(base_model, lora_config)
+model.load_state_dict(torch.load("/data/aim_nuist/aim_zhujj/xinjian/llama_gad_qlora_model.pt"))
+model.to(device)
+pipeline = transformers.pipeline(
+    "text-generation",
+    model=model,
+    tokenizer=tokenizer,
+    model_kwargs={"torch_dtype": torch.bfloat16},
+    device="cuda",
+)
+# 读取测试数据
+with open("./test1.tsv", "r") as file:
+    test_data = file.readlines()
+
+# 定义测试数据集类
+class CustomTestDataset(Dataset):
+    def __init__(self, data, tokenizer):
+        self.data = data
+        self.tokenizer = tokenizer
+
+    def __len__(self):
+        return len(self.data)
+
+    def __getitem__(self, idx):
+        text = self.data[idx].strip()
+        encoding = self.tokenizer(text, return_tensors="pt", padding=True, truncation=True)
+        return encoding
+
+# 创建数据加载器
+test_dataset = CustomTestDataset(test_data, tokenizer)
+test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=1)
+
+# 打开文件以写入预测结果
+with open("llama_gad_lora.txt", "w", encoding='utf-8') as output_file:
+    start_time = time.time()  # 记录开始时间
+
+    # 使用 tqdm 创建测试循环的进度条
+    with tqdm(test_data, desc="Testing", unit="line") as ttest:
+        for i, line in enumerate(ttest):
+            if line.strip():  # 跳过空行
+                # 构建输入文本
+                input_text = f"Text: {line.strip()}\nDo the entities in this text have a relationship? Answer with 'true' or 'false':"
+
+                # 使用模型生成提示
+                prompt = f"Based on the text: '{input_text}', determine if there is a relationship between the entities mentioned. Answer with 'true' or 'false'."
+
+                # 生成终止符号
+                terminators = [
+                    pipeline.tokenizer.eos_token_id,
+                    pipeline.tokenizer.convert_tokens_to_ids("<|eot_id|>")
+                ]
+
+                # 执行文本生成
+                outputs = pipeline(
+                    prompt,
+                    max_new_tokens=10,
+                    eos_token_id=terminators,
+                    do_sample=True,
+                    temperature=0.6,
+                    top_p=0.9,
+                )
+
+                # 解码生成的输出
+                generated_text = outputs[0]['generated_text']
+                predicted_label = generated_text.split(":")[-1].strip()  # 从生成文本中提取标签
+                print(predicted_label)
+
+                # 确保标签是 'true' 或 'false'
+                if predicted_label.lower() not in ['true', 'false']:
+                    predicted_label = 'false'  # 默认值或处理不符合要求的输出
+
+                # 写入预测结果到输出文件
+                output_file.write(f"{line.strip()}\t{predicted_label}\n")
+                output_file.flush()  # 实时刷新文件缓冲区
+
+    # 输出总测试时间
+    print(f"Testing completed in {time.time() - start_time:.2f} seconds.")
